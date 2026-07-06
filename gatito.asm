@@ -1,899 +1,648 @@
-section .data
-    clear_screen db 27,'[2J',27,'[H'
-    status_bar db 27,'[24;1H',27,'[1;33;40m ctrl+s=salvar  ctrl+q=sair  ctrl+l=ocultar  ctrl+k=recortar ',27,'[0m'
-    prompt_save db 27,'[24;1H',27,'[K',27,'[1;33;40m nome: ',27,'[0m',27,'[1;37m'
-    msg_saved db 27,'[24;1H',27,'[K',27,'[1;33;40m salvo! ',27,'[0m'
-    color_white db 27,'[1;37m'
-    color_gray db 27,'[38;5;240m'
-    scroll_region db 27,'[1;23r'
-    reset_scroll db 27,'[r'
-
-section .bss
-    buffer resb 4096
-    filename resb 260
-    cursor_x resb 1
-    cursor_y resb 1
-    buf_pos resw 1
-    termios_orig resb 60
-    termios_new resb 60
-    char resb 1
-    fname_len resq 1
-    show_lines resb 1
-    line_offset resb 1
-    current_line resw 1
-
+bits 64
 section .text
-    global _start
+global _start
+
+%define SYS_read   0
+%define SYS_write  1
+%define SYS_open   2
+%define SYS_close  3
+%define SYS_ioctl  16
+%define SYS_exit   60
+
+%define O_RDONLY 0
+%define O_WRONLY 1
+%define O_CREAT  0x40
+%define O_TRUNC  0x200
+
+%define TCGETS 0x5401
+%define TCSETS 0x5402
+%define TERMIOS_SZ 36
+
+%define BUF_CAP     65536
+%define OUT_CAP     16384
+%define SCREEN_ROWS 24
+%define SCREEN_COLS 80
+%define TEXT_ROWS   (SCREEN_ROWS-1)
+
+%define KEY_UP    1000
+%define KEY_DOWN  1001
+%define KEY_RIGHT 1002
+%define KEY_LEFT  1003
+
+%define CTRL_Q 0x11
+%define CTRL_S 0x13
 
 _start:
-    mov rax, 16
-    xor rdi, rdi
-    mov rsi, 0x5401
-    mov rdx, termios_orig
-    syscall
-    
-    mov rcx, 60
-    mov rsi, termios_orig
-    mov rdi, termios_new
-    rep movsb
-    
-    and dword [termios_new + 12], ~26
-    and dword [termios_new], ~1024
-    mov byte [termios_new + 16], 1
-    mov byte [termios_new + 17], 0
-    
-    mov rax, 16
-    xor rdi, rdi
-    mov rsi, 0x5402
-    mov rdx, termios_new
-    syscall
-    
-    mov byte [show_lines], 1
-    mov byte [line_offset], 4
-    mov word [current_line], 1
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, clear_screen
-    mov rdx, 7
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, scroll_region
-    mov rdx, 7
-    syscall
-    
-    call draw_line_num
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, status_bar
-    mov rdx, 87
-    syscall
-    
-    mov byte [cursor_x], 5
-    mov byte [cursor_y], 1
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, color_white
-    mov rdx, 7
-    syscall
+    pop     rcx
+    pop     rdi
+    cmp     rcx, 2
+    jl      .no_arg
+    pop     rsi
+    mov     [rel filename_ptr], rsi
+    jmp     .try_open
+.no_arg:
+    mov     qword [rel filename_ptr], 0
+    jmp     .after_load
 
-main_loop:
-    call update_cursor
-    
-    mov rax, 0
-    mov rdi, 0
-    mov rsi, char
-    mov rdx, 1
+.try_open:
+    mov     eax, SYS_open
+    mov     rdi, [rel filename_ptr]
+    mov     esi, O_RDONLY
+    xor     edx, edx
     syscall
-    
-    test rax, rax
-    jle main_loop
-    
-    movzx rax, byte [char]
-    
-    cmp al, 17
-    je quit
-    
-    cmp al, 19
-    je save
-    
-    cmp al, 12
-    je toggle_lines
-    
-    cmp al, 11
-    je cut_line
-    
-    cmp al, 3
-    je quit
-    
-    cmp al, 127
-    je backspace
-    
-    cmp al, 10
-    je enter
-    
-    cmp al, 27
-    je escape
-    
-    cmp al, 32
-    jl main_loop
-    
-    cmp al, 'A'
-    jl .write_char
-    cmp al, 'Z'
-    jg .write_char
-    add al, 32
-    mov [char], al
-    
-.write_char:
-    cmp byte [cursor_x], 80
-    jge main_loop
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    movzx rbx, word [buf_pos]
-    cmp rbx, 4095
-    jge main_loop
-    
-    mov al, [char]
-    mov [buffer + rbx], al
-    inc word [buf_pos]
-    inc byte [cursor_x]
-    jmp main_loop
-
-backspace:
-    movzx rax, byte [line_offset]
-    inc rax
-    cmp byte [cursor_x], al
-    jle main_loop
-    
-    dec byte [cursor_x]
-    call update_cursor
-    
-    mov byte [char], ' '
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    movzx rbx, word [buf_pos]
-    test rbx, rbx
-    jz main_loop
-    dec word [buf_pos]
-    jmp main_loop
-
-enter:
-    movzx rbx, word [buf_pos]
-    cmp rbx, 4095
-    jge main_loop
-    
-    mov byte [buffer + rbx], 10
-    inc word [buf_pos]
-    
-    cmp byte [cursor_y], 23
-    jge .scroll
-    
-    inc byte [cursor_y]
-    inc word [current_line]
-    movzx rax, byte [line_offset]
-    inc rax
-    mov [cursor_x], al
-    call draw_line_num
-    jmp main_loop
-    
-.scroll:
-    mov byte [char], 10
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    inc word [current_line]
-    movzx rax, byte [line_offset]
-    inc rax
-    mov [cursor_x], al
-    call draw_line_num
-    jmp main_loop
-
-cut_line:
-    movzx rbx, word [buf_pos]
-    test rbx, rbx
-    jz main_loop
-    
-    xor rcx, rcx
-    mov r8w, 1
-    
-.find_line_start:
-    cmp rcx, rbx
-    jge .found_start
-    
-    movzx rax, byte [buffer + rcx]
-    cmp al, 10
-    jne .not_newline_start
-    inc r8w
-    cmp r8w, word [current_line]
-    je .found_start_after_nl
-.not_newline_start:
-    inc rcx
-    jmp .find_line_start
-    
-.found_start_after_nl:
-    inc rcx
-    
-.found_start:
-    mov r9, rcx
-    
-.find_line_end:
-    cmp rcx, rbx
-    jge .found_end
-    
-    movzx rax, byte [buffer + rcx]
-    cmp al, 10
-    je .found_end_with_nl
-    inc rcx
-    jmp .find_line_end
-    
-.found_end_with_nl:
-    inc rcx
-    
-.found_end:
-    mov r10, rcx
-    
-    sub r10, r9
-    jz .cut_done
-    
-    mov rsi, rcx
-    mov rdi, r9
-    
-.shift_loop:
-    cmp rsi, rbx
-    jge .shift_done
-    
-    mov al, [buffer + rsi]
-    mov [buffer + rdi], al
-    inc rsi
-    inc rdi
-    jmp .shift_loop
-    
-.shift_done:
-    sub word [buf_pos], r10w
-    
-.cut_done:
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, clear_screen
-    mov rdx, 7
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, scroll_region
-    mov rdx, 7
-    syscall
-    
-    mov word [current_line], 1
-    mov byte [cursor_y], 1
-    movzx rax, byte [line_offset]
-    inc rax
-    mov [cursor_x], al
-    
-    xor rcx, rcx
-    movzx rbx, word [buf_pos]
-    
-.redraw_loop:
-    cmp rcx, rbx
-    jge .redraw_done
-    
-    movzx rax, byte [buffer + rcx]
-    
-    cmp al, 10
-    je .newline
-    
-    mov [char], al
-    push rcx
-    push rbx
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    pop rbx
-    pop rcx
-    inc rcx
-    jmp .redraw_loop
-    
-.newline:
-    mov byte [char], 10
-    push rcx
-    push rbx
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    pop rbx
-    pop rcx
-    inc rcx
-    inc word [current_line]
-    call draw_line_num
-    jmp .redraw_loop
-    
-.redraw_done:
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, status_bar
-    mov rdx, 87
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, color_white
-    mov rdx, 7
-    syscall
-    jmp main_loop
-
-escape:
-    mov rax, 0
-    mov rdi, 0
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    test rax, rax
-    jle main_loop
-    
-    movzx rax, byte [char]
-    cmp al, '['
-    jne main_loop
-    
-    mov rax, 0
-    mov rdi, 0
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    test rax, rax
-    jle main_loop
-    
-    movzx rax, byte [char]
-    
-    cmp al, 'A'
-    je .up
-    cmp al, 'B'
-    je .down
-    cmp al, 'C'
-    je .right
-    cmp al, 'D'
-    jne main_loop
-    
-.left:
-    movzx rax, byte [line_offset]
-    inc rax
-    cmp byte [cursor_x], al
-    jle main_loop
-    dec byte [cursor_x]
-    jmp main_loop
-
-.up:
-    cmp byte [cursor_y], 1
-    jle main_loop
-    dec byte [cursor_y]
-    cmp word [current_line], 1
-    jle main_loop
-    dec word [current_line]
-    call draw_line_num
-    jmp main_loop
-
-.down:
-    cmp byte [cursor_y], 23
-    jge main_loop
-    inc byte [cursor_y]
-    inc word [current_line]
-    call draw_line_num
-    jmp main_loop
-
-.right:
-    cmp byte [cursor_x], 80
-    jge main_loop
-    inc byte [cursor_x]
-    jmp main_loop
-
-toggle_lines:
-    xor byte [show_lines], 1
-    
-    cmp byte [show_lines], 1
-    je .show
-    
-    mov byte [line_offset], 0
-    cmp byte [cursor_x], 5
-    jl .do_redraw
-    sub byte [cursor_x], 4
-    jmp .do_redraw
-    
-.show:
-    mov byte [line_offset], 4
-    add byte [cursor_x], 4
-    
-.do_redraw:
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, clear_screen
-    mov rdx, 7
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, scroll_region
-    mov rdx, 7
-    syscall
-    
-    mov word [current_line], 1
-    mov byte [cursor_y], 1
-    
-    xor rcx, rcx
-    movzx rbx, word [buf_pos]
-    
-.redraw_loop:
-    cmp rcx, rbx
-    jge .redraw_done
-    
-    movzx rax, byte [buffer + rcx]
-    
-    cmp al, 10
-    je .newline
-    
-    mov [char], al
-    push rcx
-    push rbx
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    pop rbx
-    pop rcx
-    inc rcx
-    jmp .redraw_loop
-    
-.newline:
-    mov byte [char], 10
-    push rcx
-    push rbx
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    pop rbx
-    pop rcx
-    inc rcx
-    inc word [current_line]
-    call draw_line_num
-    jmp .redraw_loop
-    
-.redraw_done:
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, status_bar
-    mov rdx, 87
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, color_white
-    mov rdx, 7
-    syscall
-    jmp main_loop
-
-draw_line_num:
-    cmp byte [show_lines], 0
-    je .skip
-    
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    
-    mov byte [char], 27
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '['
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    movzx rax, byte [cursor_y]
-    call print_num
-    
-    mov byte [char], ';'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '1'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], 'H'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, color_gray
-    mov rdx, 11
-    syscall
-    
-    movzx rax, word [current_line]
-    call print_num
-    
-    mov byte [char], ' '
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '|'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], ' '
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, color_white
-    mov rdx, 7
-    syscall
-    
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-.skip:
-    ret
-
-save:
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, reset_scroll
-    mov rdx, 3
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, prompt_save
-    mov rdx, 30
-    syscall
-    
-    mov qword [fname_len], 0
-    
+    test    rax, rax
+    js      .after_load
+    mov     r12d, eax
 .read_loop:
-    mov rax, 0
-    mov rdi, 0
-    mov rsi, char
-    mov rdx, 1
+    mov     eax, SYS_read
+    mov     edi, r12d
+    lea     rsi, [rel buf]
+    add     rsi, [rel buf_len]
+    mov     rdx, BUF_CAP
+    sub     rdx, [rel buf_len]
     syscall
-    
-    test rax, rax
-    jle .read_loop
-    
-    movzx rax, byte [char]
-    
-    cmp al, 10
-    je .do_save
-    
-    cmp al, 127
-    je .backspace_fname
-    
-    cmp al, 3
-    je .cancel
-    
-    cmp al, 27
-    je .cancel
-    
-    cmp al, 32
-    jl .read_loop
-    
-    cmp al, 'A'
-    jl .write_fname
-    cmp al, 'Z'
-    jg .write_fname
-    add al, 32
-    mov [char], al
-    
-.write_fname:
-    mov r8, [fname_len]
-    cmp r8, 255
-    jge .read_loop
-    
-    mov [filename + r8], al
-    inc qword [fname_len]
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+    test    rax, rax
+    jle     .read_done
+    add     [rel buf_len], rax
+    jmp     .read_loop
+.read_done:
+    mov     edi, r12d
+    mov     eax, SYS_close
     syscall
-    jmp .read_loop
+.after_load:
 
-.backspace_fname:
-    cmp qword [fname_len], 0
-    je .read_loop
-    
-    dec qword [fname_len]
-    
-    mov byte [char], 8
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], ' '
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], 8
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    jmp .read_loop
+    call    enable_raw_mode
 
+.main_loop:
+    call    render
+    call    read_key
+
+    cmp     eax, CTRL_Q
+    je      .do_quit
+    cmp     eax, CTRL_S
+    je      .do_save
+    cmp     eax, KEY_UP
+    je      .do_up
+    cmp     eax, KEY_DOWN
+    je      .do_down
+    cmp     eax, KEY_LEFT
+    je      .do_left
+    cmp     eax, KEY_RIGHT
+    je      .do_right
+    cmp     eax, 0x7f
+    je      .do_backspace
+    cmp     eax, 0x08
+    je      .do_backspace
+    cmp     eax, 0x0d
+    je      .do_enter
+    cmp     eax, 0x20
+    jl      .main_loop
+    cmp     eax, 0x7e
+    jg      .main_loop
+    call    insert_char
+    jmp     .main_loop
+
+.do_up:
+    call    move_up
+    jmp     .main_loop
+.do_down:
+    call    move_down
+    jmp     .main_loop
+.do_left:
+    call    move_left
+    jmp     .main_loop
+.do_right:
+    call    move_right
+    jmp     .main_loop
+.do_backspace:
+    call    do_backspace
+    jmp     .main_loop
+.do_enter:
+    mov     eax, 0x0a
+    call    insert_char
+    jmp     .main_loop
 .do_save:
-    cmp qword [fname_len], 0
-    je .cancel
-    
-    mov r8, [fname_len]
-    mov byte [filename + r8], 0
-    
-    mov rax, 2
-    mov rdi, filename
-    mov rsi, 0x241
-    mov rdx, 0x1B6
+    call    save_file
+    jmp     .main_loop
+
+.do_quit:
+    call    disable_raw_mode
+    mov     eax, SYS_write
+    mov     edi, 1
+    lea     rsi, [rel esc_clear]
+    mov     edx, esc_clear_len
     syscall
-    
-    cmp rax, 0
-    jl .cancel
-    
-    mov r15, rax
-    
-    mov rax, 1
-    mov rdi, r15
-    mov rsi, buffer
-    movzx rdx, word [buf_pos]
-    syscall
-    
-    mov rax, 3
-    mov rdi, r15
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, msg_saved
-    mov rdx, 28
-    syscall
-    
-    mov rax, 0
-    mov rdi, 0
-    mov rsi, char
-    mov rdx, 1
+    xor     edi, edi
+    mov     eax, SYS_exit
     syscall
 
-.cancel:
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, clear_screen
-    mov rdx, 7
+enable_raw_mode:
+    mov     eax, SYS_ioctl
+    xor     edi, edi
+    mov     esi, TCGETS
+    lea     rdx, [rel orig_termios]
     syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, scroll_region
-    mov rdx, 7
-    syscall
-    
-    call draw_line_num
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, status_bar
-    mov rdx, 87
-    syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, color_white
-    mov rdx, 7
-    syscall
-    jmp main_loop
 
-update_cursor:
-    mov byte [char], 27
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '['
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    movzx rax, byte [cursor_y]
-    call print_num
-    
-    mov byte [char], ';'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    movzx rax, byte [cursor_x]
-    call print_num
-    
-    mov byte [char], 'H'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+    lea     rsi, [rel orig_termios]
+    lea     rdi, [rel raw_termios]
+    mov     ecx, TERMIOS_SZ
+    rep     movsb
+
+    mov     eax, [rel raw_termios+0]
+    and     eax, ~0x0532
+    mov     [rel raw_termios+0], eax
+
+    mov     eax, [rel raw_termios+4]
+    and     eax, ~0x0001
+    mov     [rel raw_termios+4], eax
+
+    mov     eax, [rel raw_termios+8]
+    or      eax, 0x0030
+    mov     [rel raw_termios+8], eax
+
+    mov     eax, [rel raw_termios+12]
+    and     eax, ~0x800B
+    mov     [rel raw_termios+12], eax
+
+    mov     byte [rel raw_termios+23], 1
+    mov     byte [rel raw_termios+22], 0
+
+    mov     eax, SYS_ioctl
+    xor     edi, edi
+    mov     esi, TCSETS
+    lea     rdx, [rel raw_termios]
     syscall
     ret
 
-print_num:
-    mov rbx, 10
-    xor rcx, rcx
-.div:
-    xor rdx, rdx
-    div rbx
-    push rdx
-    inc rcx
-    test rax, rax
-    jnz .div
-.pr:
-    pop rax
-    add al, '0'
-    mov [char], al
-    push rcx
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+disable_raw_mode:
+    mov     eax, SYS_ioctl
+    xor     edi, edi
+    mov     esi, TCSETS
+    lea     rdx, [rel orig_termios]
     syscall
-    pop rcx
-    loop .pr
     ret
 
-quit:
-    mov rax, 16
-    xor rdi, rdi
-    mov rsi, 0x5402
-    mov rdx, termios_orig
+read_key:
+.rk_read:
+    lea     rsi, [rel keybuf]
+    mov     edx, 1
+    xor     edi, edi
+    mov     eax, SYS_read
     syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, reset_scroll
-    mov rdx, 3
+    test    rax, rax
+    jle     .rk_read
+    movzx   eax, byte [rel keybuf]
+    cmp     al, 0x1b
+    jne     .rk_ret
+
+    lea     rsi, [rel keybuf]
+    mov     edx, 1
+    xor     edi, edi
+    mov     eax, SYS_read
     syscall
-    
-    mov byte [char], 27
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+    test    rax, rax
+    jle     .rk_esc_alone
+    cmp     byte [rel keybuf], '['
+    jne     .rk_esc_alone
+
+    lea     rsi, [rel keybuf]
+    mov     edx, 1
+    xor     edi, edi
+    mov     eax, SYS_read
     syscall
-    
-    mov byte [char], '['
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+    test    rax, rax
+    jle     .rk_esc_alone
+    movzx   eax, byte [rel keybuf]
+    cmp     al, 'A'
+    je      .rk_up
+    cmp     al, 'B'
+    je      .rk_down
+    cmp     al, 'C'
+    je      .rk_right
+    cmp     al, 'D'
+    je      .rk_left
+    xor     eax, eax
+    ret
+.rk_up:
+    mov     eax, KEY_UP
+    ret
+.rk_down:
+    mov     eax, KEY_DOWN
+    ret
+.rk_right:
+    mov     eax, KEY_RIGHT
+    ret
+.rk_left:
+    mov     eax, KEY_LEFT
+    ret
+.rk_esc_alone:
+    mov     eax, 0x1b
+    ret
+.rk_ret:
+    ret
+
+scan_cursor:
+    xor     r8, r8
+    xor     r9, r9
+    xor     rax, rax
+.sc_loop:
+    cmp     rax, [rel cursor_pos]
+    jge     .sc_done
+    cmp     byte [rel buf+rax], 0x0a
+    jne     .sc_notnl
+    inc     r8
+    xor     r9, r9
+    jmp     .sc_next
+.sc_notnl:
+    inc     r9
+.sc_next:
+    inc     rax
+    jmp     .sc_loop
+.sc_done:
+    mov     [rel cur_cy], r8
+    mov     [rel cur_cx], r9
+    ret
+
+get_line_offset:
+    xor     rax, rax
+    xor     rdx, rdx
+.gl_loop:
+    cmp     rdx, rdi
+    je      .gl_found
+.gl_scan:
+    cmp     rax, [rel buf_len]
+    jge     .gl_nf
+    cmp     byte [rel buf+rax], 0x0a
+    je      .gl_adv
+    inc     rax
+    jmp     .gl_scan
+.gl_adv:
+    inc     rax
+    inc     rdx
+    jmp     .gl_loop
+.gl_found:
+    ret
+.gl_nf:
+    mov     rax, -1
+    ret
+
+line_length:
+    mov     rcx, rdi
+.ll_loop:
+    cmp     rcx, [rel buf_len]
+    jge     .ll_done
+    cmp     byte [rel buf+rcx], 0x0a
+    je      .ll_done
+    inc     rcx
+    jmp     .ll_loop
+.ll_done:
+    sub     rcx, rdi
+    ret
+
+move_left:
+    cmp     qword [rel cursor_pos], 0
+    je      .ml_ret
+    dec     qword [rel cursor_pos]
+.ml_ret:
+    ret
+
+move_right:
+    mov     rax, [rel cursor_pos]
+    cmp     rax, [rel buf_len]
+    jge     .mr_ret
+    inc     qword [rel cursor_pos]
+.mr_ret:
+    ret
+
+move_up:
+    call    scan_cursor
+    mov     rax, [rel cur_cy]
+    test    rax, rax
+    jz      .mu_ret
+    dec     rax
+    mov     rdi, rax
+    call    get_line_offset
+    cmp     rax, -1
+    je      .mu_ret
+    mov     r10, rax
+    mov     rdi, rax
+    call    line_length
+    mov     rax, [rel cur_cx]
+    cmp     rax, rcx
+    jle     .mu_col_ok
+    mov     rax, rcx
+.mu_col_ok:
+    add     rax, r10
+    mov     [rel cursor_pos], rax
+.mu_ret:
+    ret
+
+move_down:
+    call    scan_cursor
+    mov     rax, [rel cur_cy]
+    inc     rax
+    mov     rdi, rax
+    call    get_line_offset
+    cmp     rax, -1
+    je      .md_ret
+    mov     r10, rax
+    mov     rdi, rax
+    call    line_length
+    mov     rax, [rel cur_cx]
+    cmp     rax, rcx
+    jle     .md_col_ok
+    mov     rax, rcx
+.md_col_ok:
+    add     rax, r10
+    mov     [rel cursor_pos], rax
+.md_ret:
+    ret
+
+insert_char:
+    mov     r10d, eax
+    mov     rax, [rel buf_len]
+    cmp     rax, BUF_CAP-1
+    jge     .ic_full
+    mov     rsi, [rel buf_len]
+.ic_shift:
+    cmp     rsi, [rel cursor_pos]
+    jle     .ic_shift_done
+    mov     rax, rsi
+    dec     rax
+    movzx   edx, byte [rel buf+rax]
+    mov     [rel buf+rsi], dl
+    dec     rsi
+    jmp     .ic_shift
+.ic_shift_done:
+    mov     rax, [rel cursor_pos]
+    mov     [rel buf+rax], r10b
+    inc     qword [rel buf_len]
+    inc     qword [rel cursor_pos]
+    mov     byte [rel modified], 1
+.ic_full:
+    ret
+
+do_backspace:
+    cmp     qword [rel cursor_pos], 0
+    je      .bs_ret
+    mov     rsi, [rel cursor_pos]
+    dec     rsi
+.bs_loop:
+    mov     rax, [rel buf_len]
+    dec     rax
+    cmp     rsi, rax
+    jge     .bs_loop_done
+    mov     rax, rsi
+    inc     rax
+    movzx   edx, byte [rel buf+rax]
+    mov     [rel buf+rsi], dl
+    inc     rsi
+    jmp     .bs_loop
+.bs_loop_done:
+    dec     qword [rel buf_len]
+    dec     qword [rel cursor_pos]
+    mov     byte [rel modified], 1
+.bs_ret:
+    ret
+
+save_file:
+    mov     rdi, [rel filename_ptr]
+    test    rdi, rdi
+    jz      .sv_ret
+    mov     eax, SYS_open
+    mov     esi, O_WRONLY|O_CREAT|O_TRUNC
+    mov     edx, 0644o
     syscall
-    
-    mov byte [char], '0'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+    test    rax, rax
+    js      .sv_ret
+    mov     r12d, eax
+    xor     r13, r13
+.sv_loop:
+    mov     rax, [rel buf_len]
+    cmp     r13, rax
+    jge     .sv_done
+    mov     eax, SYS_write
+    mov     edi, r12d
+    lea     rsi, [rel buf]
+    add     rsi, r13
+    mov     rdx, [rel buf_len]
+    sub     rdx, r13
     syscall
-    
-    mov byte [char], 'm'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
+    test    rax, rax
+    jle     .sv_done
+    add     r13, rax
+    jmp     .sv_loop
+.sv_done:
+    mov     edi, r12d
+    mov     eax, SYS_close
     syscall
-    
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, clear_screen
-    mov rdx, 7
+    mov     byte [rel modified], 0
+.sv_ret:
+    ret
+
+append:
+    push    rcx
+    push    rdi
+    lea     rdi, [rel out_buf]
+    add     rdi, [rel out_len]
+    rep     movsb
+    pop     rdi
+    pop     rcx
+    add     [rel out_len], rcx
+    ret
+
+write_num2:
+    cmp     eax, 10
+    jl      .wn_one
+    xor     edx, edx
+    mov     ecx, 10
+    div     ecx
+    add     al, '0'
+    mov     [rdi], al
+    inc     rdi
+    add     dl, '0'
+    mov     [rdi], dl
+    inc     rdi
+    ret
+.wn_one:
+    add     al, '0'
+    mov     [rdi], al
+    inc     rdi
+    ret
+
+render:
+    mov     qword [rel out_len], 0
+
+    call    scan_cursor
+
+    mov     rax, [rel cur_cy]
+    cmp     rax, [rel top_line]
+    jl      .set_top_up
+    mov     rdx, [rel top_line]
+    add     rdx, TEXT_ROWS-1
+    cmp     rax, rdx
+    jg      .set_top_down
+    jmp     .top_ok
+.set_top_up:
+    mov     [rel top_line], rax
+    jmp     .top_ok
+.set_top_down:
+    sub     rax, TEXT_ROWS-1
+    mov     [rel top_line], rax
+.top_ok:
+
+    lea     rsi, [rel esc_hide]
+    mov     rcx, esc_hide_len
+    call    append
+    lea     rsi, [rel esc_home]
+    mov     rcx, esc_home_len
+    call    append
+
+    xor     r15, r15
+.draw_loop:
+    cmp     r15, TEXT_ROWS
+    jge     .draw_done
+
+    mov     rdi, [rel top_line]
+    add     rdi, r15
+    call    get_line_offset
+    cmp     rax, -1
+    je      .row_clear
+
+    mov     rdi, rax
+    push    rax
+    call    line_length
+    pop     rax
+    cmp     rcx, SCREEN_COLS
+    jle     .len_ok
+    mov     rcx, SCREEN_COLS
+.len_ok:
+    lea     rsi, [rel buf]
+    add     rsi, rax
+    call    append
+
+.row_clear:
+    lea     rsi, [rel esc_clreol]
+    mov     rcx, esc_clreol_len
+    call    append
+    lea     rsi, [rel crlf]
+    mov     rcx, crlf_len
+    call    append
+
+    inc     r15
+    jmp     .draw_loop
+.draw_done:
+
+    call    render_status
+    call    position_cursor
+
+    lea     rsi, [rel esc_show]
+    mov     rcx, esc_show_len
+    call    append
+
+    mov     eax, SYS_write
+    mov     edi, 1
+    lea     rsi, [rel out_buf]
+    mov     rdx, [rel out_len]
     syscall
-    
-    mov byte [char], 27
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '['
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '?'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '2'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], '5'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov byte [char], 'l'
-    mov rax, 1
-    mov rdi, 1
-    mov rsi, char
-    mov rdx, 1
-    syscall
-    
-    mov rax, 60
-    xor rdi, rdi
-    syscall
+    ret
+
+render_status:
+    mov     rdi, [rel filename_ptr]
+    test    rdi, rdi
+    jnz     .rs_have_name
+    lea     rsi, [rel noname_str]
+    mov     rcx, noname_len
+    call    append
+    jmp     .rs_after_name
+.rs_have_name:
+    mov     rsi, rdi
+    xor     rcx, rcx
+.rs_strlen:
+    cmp     byte [rsi+rcx], 0
+    je      .rs_strlen_done
+    inc     rcx
+    jmp     .rs_strlen
+.rs_strlen_done:
+    call    append
+.rs_after_name:
+    cmp     byte [rel modified], 0
+    je      .rs_no_mod
+    lea     rsi, [rel mod_str]
+    mov     rcx, mod_len
+    call    append
+.rs_no_mod:
+    lea     rsi, [rel hint_str]
+    mov     rcx, hint_len
+    call    append
+    lea     rsi, [rel esc_clreol]
+    mov     rcx, esc_clreol_len
+    call    append
+    ret
+
+position_cursor:
+    lea     rdi, [rel pos_tmp]
+    mov     byte [rdi], 0x1b
+    mov     byte [rdi+1], '['
+    add     rdi, 2
+
+    mov     rax, [rel cur_cy]
+    sub     rax, [rel top_line]
+    inc     rax
+    call    write_num2
+
+    mov     byte [rdi], ';'
+    inc     rdi
+
+    mov     rax, [rel cur_cx]
+    cmp     rax, SCREEN_COLS-1
+    jle     .pc_col_ok
+    mov     rax, SCREEN_COLS-1
+.pc_col_ok:
+    inc     rax
+    call    write_num2
+
+    mov     byte [rdi], 'H'
+    inc     rdi
+
+    lea     rsi, [rel pos_tmp]
+    mov     rcx, rdi
+    sub     rcx, rsi
+    call    append
+    ret
+
+section .data
+esc_hide:       db 0x1b,"[?25l"
+esc_hide_len    equ $-esc_hide
+esc_show:       db 0x1b,"[?25h"
+esc_show_len    equ $-esc_show
+esc_home:       db 0x1b,"[H"
+esc_home_len    equ $-esc_home
+esc_clreol:     db 0x1b,"[K"
+esc_clreol_len  equ $-esc_clreol
+esc_clear:      db 0x1b,"[2J",0x1b,"[H"
+esc_clear_len   equ $-esc_clear
+crlf:           db 0x0d,0x0a
+crlf_len        equ $-crlf
+noname_str:     db "[sem nome]"
+noname_len      equ $-noname_str
+mod_str:        db " [+]"
+mod_len         equ $-mod_str
+hint_str:       db "  ^S salvar  ^Q sair"
+hint_len        equ $-hint_str
+
+section .bss
+filename_ptr:  resq 1
+buf:           resb BUF_CAP
+buf_len:       resq 1
+cursor_pos:    resq 1
+top_line:      resq 1
+modified:      resb 1
+cur_cy:        resq 1
+cur_cx:        resq 1
+out_buf:       resb OUT_CAP
+out_len:       resq 1
+pos_tmp:       resb 32
+keybuf:        resb 1
+orig_termios:  resb TERMIOS_SZ
+raw_termios:   resb TERMIOS_SZ
